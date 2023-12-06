@@ -16,6 +16,12 @@
 -export([decrypt_config/2]).
 -endif.
 
+%% These can be removed when we only support OTP-26+.
+-ignore_xref([{user_drv, whereis_group, 0},
+              {group, interfaces, 1},
+              {user_drv, interfaces, 1}]).
+-dialyzer({nowarn_function, [get_input_iodevice/0]}).
+
 setup(Context) ->
     ?LOG_DEBUG(
        "\n== Configuration ==",
@@ -122,10 +128,39 @@ set_default_config() ->
                 {schedule_ms_limit, 0},
                 {heap_word_limit, 0},
                 {busy_port, false},
-                {busy_dist_port, true}]}
-                | OsirisConfig
+                {busy_dist_port, true}]},
+              {mnesia,
+               [
+                {dump_log_write_threshold, 5000},
+                {dump_log_time_threshold, 90000}
+               ]}
+              | OsirisConfig
              ],
-    apply_erlang_term_based_config(Config).
+    %% Don't apply any defaults for values already set in the init flags.
+    Config1 = filter_init_args(Config),
+    apply_erlang_term_based_config(Config1).
+
+filter_init_args(Config) ->
+    lists:filtermap(
+      fun({App, Vars}) ->
+          case init:get_argument(App) of
+              {ok, Args} ->
+                  Keys = [rabbit_data_coercion:to_atom(KeyName) ||
+                          [KeyName, _ValueExpr] <- Args],
+                  Vars1 = lists:filter(
+                            fun({Key, _Value}) ->
+                                not lists:member(Key, Keys)
+                            end, Vars),
+                  case Vars1 of
+                      [] ->
+                          false;
+                      _ ->
+                          {true, {App, Vars1}}
+                  end;
+              error ->
+                  true
+          end
+      end, Config).
 
 osiris_log(debug, Fmt, Args) ->
     ?LOG_DEBUG(Fmt, Args,
@@ -397,8 +432,8 @@ override_with_advanced_config(Config, AdvancedConfigFile) ->
             throw({error, failed_to_parse_advanced_configuration_file});
         {error, Reason} ->
             ?LOG_ERROR(
-              "Failed to load advanced configuration file \"~ts\": ~ts",
-              [AdvancedConfigFile, file:format_error(Reason)],
+              "Failed to load advanced configuration file \"~ts\": ~tp",
+              [AdvancedConfigFile, Reason],
               #{domain => ?RMQLOG_DOMAIN_PRELAUNCH}),
             throw({error, failed_to_read_advanced_configuration_file})
     end.
@@ -560,17 +595,26 @@ get_passphrase(ConfigEntryDecoder) ->
 %% This function will not work when either -oldshell or -noinput
 %% options are passed to erl.
 get_input_iodevice() ->
-    case whereis(user) of
-        undefined ->
-            user;
-        User ->
-            case group:interfaces(User) of
-                [] ->
+    case erlang:function_exported(user_drv, whereis_group, 0) of
+        true ->
+            case user_drv:whereis_group() of
+                undefined -> user;
+                IoDevice -> IoDevice
+            end;
+        %% Necessary for OTP versions before OTP-26.
+        false ->
+            case whereis(user) of
+                undefined ->
                     user;
-                [{user_drv, Drv}] ->
-                    case user_drv:interfaces(Drv) of
-                        []                          -> user;
-                        [{current_group, IoDevice}] -> IoDevice
+                User ->
+                    case group:interfaces(User) of
+                        [] ->
+                            user;
+                        [{user_drv, Drv}] ->
+                            case user_drv:interfaces(Drv) of
+                                []                          -> user;
+                                [{current_group, IoDevice}] -> IoDevice
+                            end
                     end
             end
     end.

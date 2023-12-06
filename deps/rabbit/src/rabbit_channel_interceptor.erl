@@ -2,7 +2,7 @@
 %% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at https://mozilla.org/MPL/2.0/.
 %%
-%% Copyright (c) 2007-2022 VMware, Inc. or its affiliates.  All rights reserved.
+%% Copyright (c) 2007-2023 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  All rights reserved.
 %%
 
 -module(rabbit_channel_interceptor).
@@ -48,7 +48,7 @@ check_no_overlap(Mods) ->
 
 %% Check no non-empty pairwise intersection in a list of sets
 check_no_overlap1(Sets) ->
-    lists:foldl(fun(Set, Union) ->
+    _ = lists:foldl(fun(Set, Union) ->
                     Is = sets:intersection(Set, Union),
                     case sets:size(Is) of
                         0 -> ok;
@@ -72,7 +72,9 @@ call_module(Mod, St, M, C) ->
     % this little dance is because Mod might be unloaded at any point
     case (catch {ok, Mod:intercept(M, C, St)}) of
         {ok, R} -> validate_response(Mod, M, C, R);
-        {'EXIT', {undef, [{Mod, intercept, _, _} | _]}} -> {M, C}
+        {'EXIT', {undef, [{Mod, intercept, _, _} | _]}} -> {M, C};
+        {'EXIT', {amqp_error, _Type, _ErrMsg, _} = AMQPError} ->
+            rabbit_misc:protocol_error(AMQPError)
     end.
 
 validate_response(Mod, M1, C1, R = {M2, C2}) ->

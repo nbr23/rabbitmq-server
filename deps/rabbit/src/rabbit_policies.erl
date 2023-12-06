@@ -2,7 +2,7 @@
 %% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at https://mozilla.org/MPL/2.0/.
 %%
-%% Copyright (c) 2007-2022 VMware, Inc. or its affiliates.  All rights reserved.
+%% Copyright (c) 2007-2023 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  All rights reserved.
 %%
 
 -module(rabbit_policies).
@@ -28,6 +28,7 @@ register() ->
     %% such as rabbit_mirror_queue_misc
     [rabbit_registry:register(Class, Name, ?MODULE) ||
         {Class, Name} <- [{policy_validator, <<"alternate-exchange">>},
+                          {policy_validator, <<"consumer-timeout">>},
                           {policy_validator, <<"dead-letter-exchange">>},
                           {policy_validator, <<"dead-letter-routing-key">>},
                           {policy_validator, <<"dead-letter-strategy">>},
@@ -43,6 +44,7 @@ register() ->
                           {policy_validator, <<"delivery-limit">>},
                           {policy_validator, <<"max-age">>},
                           {policy_validator, <<"stream-max-segment-size-bytes">>},
+                          {policy_validator, <<"stream-filter-size-bytes">>},
                           {policy_validator, <<"queue-leader-locator">>},
                           {policy_validator, <<"initial-cluster-size">>},
                           {operator_policy_validator, <<"expires">>},
@@ -52,13 +54,17 @@ register() ->
                           {operator_policy_validator, <<"max-in-memory-length">>},
                           {operator_policy_validator, <<"max-in-memory-bytes">>},
                           {operator_policy_validator, <<"delivery-limit">>},
+                          {operator_policy_validator, <<"queue-version">>},
+                          {operator_policy_validator, <<"overflow">>},
                           {policy_merge_strategy, <<"expires">>},
                           {policy_merge_strategy, <<"message-ttl">>},
                           {policy_merge_strategy, <<"max-length">>},
                           {policy_merge_strategy, <<"max-length-bytes">>},
                           {policy_merge_strategy, <<"max-in-memory-length">>},
                           {policy_merge_strategy, <<"max-in-memory-bytes">>},
-                          {policy_merge_strategy, <<"delivery-limit">>}]],
+                          {policy_merge_strategy, <<"delivery-limit">>},
+                          {policy_merge_strategy, <<"queue-version">>},
+                          {policy_merge_strategy, <<"overflow">>}]],
     ok.
 
 -spec validate_policy([{binary(), term()}]) -> rabbit_policy_validator:validate_results().
@@ -73,6 +79,12 @@ validate_policy0(<<"alternate-exchange">>, Value)
     ok;
 validate_policy0(<<"alternate-exchange">>, Value) ->
     {error, "~tp is not a valid alternate exchange name", [Value]};
+
+validate_policy0(<<"consumer-timeout">>, Value)
+  when is_integer(Value), Value >= 0 ->
+    ok;
+validate_policy0(<<"consumer-timeout">>, Value) ->
+    {error, "~tp is not a valid consumer timeout", [Value]};
 
 validate_policy0(<<"dead-letter-exchange">>, Value)
   when is_binary(Value) ->
@@ -188,7 +200,13 @@ validate_policy0(<<"stream-max-segment-size-bytes">>, Value)
   when is_integer(Value), Value >= 0, Value =< ?MAX_STREAM_MAX_SEGMENT_SIZE ->
     ok;
 validate_policy0(<<"stream-max-segment-size-bytes">>, Value) ->
-    {error, "~tp is not a valid segment size", [Value]}.
+    {error, "~tp is not a valid segment size", [Value]};
+
+validate_policy0(<<"stream-filter-size-bytes">>, Value)
+  when is_integer(Value), Value >= 16, Value =< 255 ->
+    ok;
+validate_policy0(<<"stream-filter-size-bytes">>, Value) ->
+    {error, "~tp is not a valid filter size. Valid range is 16-255", [Value]}.
 
 merge_policy_value(<<"message-ttl">>, Val, OpVal)      -> min(Val, OpVal);
 merge_policy_value(<<"max-length">>, Val, OpVal)       -> min(Val, OpVal);
@@ -197,5 +215,7 @@ merge_policy_value(<<"max-in-memory-length">>, Val, OpVal) -> min(Val, OpVal);
 merge_policy_value(<<"max-in-memory-bytes">>, Val, OpVal) -> min(Val, OpVal);
 merge_policy_value(<<"expires">>, Val, OpVal)          -> min(Val, OpVal);
 merge_policy_value(<<"delivery-limit">>, Val, OpVal)   -> min(Val, OpVal);
+merge_policy_value(<<"queue-version">>, _Val, OpVal)   -> OpVal;
+merge_policy_value(<<"overflow">>, _Val, OpVal)   -> OpVal;
 %% use operator policy value for booleans
 merge_policy_value(_Key, Val, OpVal) when is_boolean(Val) andalso is_boolean(OpVal) -> OpVal.

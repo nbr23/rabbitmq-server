@@ -2,7 +2,7 @@
 %% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at https://mozilla.org/MPL/2.0/.
 %%
-%% Copyright (c) 2007-2022 VMware, Inc. or its affiliates.  All rights reserved.
+%% Copyright (c) 2007-2023 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  All rights reserved.
 %%
 
 -module(amqp10_client_SUITE).
@@ -24,8 +24,14 @@ groups() ->
     [
      {tests, [], [
                   reliable_send_receive_with_outcomes,
+                  publishing_to_non_existing_queue_should_settle_with_released,
+                  open_link_to_non_existing_destination_should_end_session,
+                  roundtrip_classic_queue_with_drain,
                   roundtrip_quorum_queue_with_drain,
-                  message_headers_conversion
+                  roundtrip_stream_queue_with_drain,
+                  amqp_stream_amqpl,
+                  message_headers_conversion,
+                  resource_alarm
                  ]},
      {metrics, [], [
                     auth_attempt_metrics
@@ -149,16 +155,90 @@ reliable_send_receive(Config, Outcome) ->
 
     ok.
 
-roundtrip_quorum_queue_with_drain(Config) ->
+publishing_to_non_existing_queue_should_settle_with_released(Config) ->
+    Container = atom_to_binary(?FUNCTION_NAME, utf8),
+    Suffix = <<"foo">>,
+    %% does not exist
+    QName = <<Container/binary, Suffix/binary>>,
     Host = ?config(rmq_hostname, Config),
     Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_amqp),
+    Address = <<"/exchange/amq.direct/", QName/binary>>,
+
+    OpnConf = #{address => Host,
+                port => Port,
+                container_id => Container,
+                sasl => {plain, <<"guest">>, <<"guest">>}},
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session(Connection),
+    SenderLinkName = <<"test-sender">>,
+    {ok, Sender} = amqp10_client:attach_sender_link(Session,
+                                                    SenderLinkName,
+                                                    Address),
+    ok = wait_for_credit(Sender),
+    DTag1 = <<"dtag-1">>,
+    %% create an unsettled message,
+    %% link will be in "mixed" mode by default
+    Msg1 = amqp10_msg:new(DTag1, <<"body-1">>, false),
+    ok = amqp10_client:send_msg(Sender, Msg1),
+    ok = wait_for_settlement(DTag1, released),
+
+    ok = amqp10_client:detach_link(Sender),
+    ok = amqp10_client:close_connection(Connection),
+    flush("post sender close"),
+    ok.
+
+open_link_to_non_existing_destination_should_end_session(Config) ->
+    Container = atom_to_list(?FUNCTION_NAME),
+    Name = Container ++ "foo",
+    Addresses = [
+                 "/exchange/" ++ Name ++ "/bar",
+                 "/amq/queue/" ++ Name
+                ],
+    Host = ?config(rmq_hostname, Config),
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_amqp),
+    OpnConf = #{address => Host,
+                port => Port,
+                container_id => list_to_binary(Container),
+                sasl => {plain, <<"guest">>, <<"guest">>}},
+
+    [begin
+         {ok, Connection} = amqp10_client:open_connection(OpnConf),
+         {ok, Session} = amqp10_client:begin_session(Connection),
+         SenderLinkName = <<"test-sender">>,
+         ct:pal("Address ~p", [Address]),
+         {ok, _} = amqp10_client:attach_sender_link(Session,
+                                                    SenderLinkName,
+                                                    list_to_binary(Address)),
+
+         wait_for_session_end(Session),
+         ok = amqp10_client:close_connection(Connection),
+         flush("post sender close")
+
+     end || Address <- Addresses],
+    ok.
+
+roundtrip_classic_queue_with_drain(Config) ->
     QName  = atom_to_binary(?FUNCTION_NAME, utf8),
+    roundtrip_queue_with_drain(Config, <<"classic">>, QName).
+
+roundtrip_quorum_queue_with_drain(Config) ->
+    QName  = atom_to_binary(?FUNCTION_NAME, utf8),
+    roundtrip_queue_with_drain(Config, <<"quorum">>, QName).
+
+roundtrip_stream_queue_with_drain(Config) ->
+    QName  = atom_to_binary(?FUNCTION_NAME, utf8),
+    roundtrip_queue_with_drain(Config, <<"stream">>, QName).
+
+roundtrip_queue_with_drain(Config, QueueType, QName) when is_binary(QueueType) ->
+    Host = ?config(rmq_hostname, Config),
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_amqp),
     Address = <<"/amq/queue/", QName/binary>>,
-    %% declare a quorum queue
+    %% declare a queue
     Ch = rabbit_ct_client_helpers:open_channel(Config, 0),
+    Args = [{<<"x-queue-type">>, longstr, QueueType}],
     amqp_channel:call(Ch, #'queue.declare'{queue = QName,
                                            durable = true,
-                                           arguments = [{<<"x-queue-type">>, longstr, <<"quorum">>}]}),
+                                           arguments = Args}),
     % create a configuration map
     OpnConf = #{address => Host,
                 port => Port,
@@ -182,16 +262,29 @@ roundtrip_quorum_queue_with_drain(Config) ->
 
     flush("pre-receive"),
     % create a receiver link
-    {ok, Receiver} = amqp10_client:attach_receiver_link(Session,
-                                                        <<"test-receiver">>,
-                                                        Address),
+
+    TerminusDurability = none,
+    Filter = case QueueType of
+                 <<"stream">> ->
+                     #{<<"rabbitmq:stream-offset-spec">> => <<"first">>};
+                 _ ->
+                     #{}
+             end,
+    Properties = #{},
+    {ok, Receiver} = amqp10_client:attach_receiver_link(Session, <<"test-receiver">>,
+                                                        Address, unsettled,
+                                                        TerminusDurability,
+                                                        Filter, Properties),
 
     % grant credit and drain
     ok = amqp10_client:flow_link_credit(Receiver, 1, never, true),
 
     % wait for a delivery
     receive
-        {amqp10_msg, Receiver, _InMsg} -> ok
+        {amqp10_msg, Receiver, InMsg} ->
+            ok = amqp10_client:accept_msg(Receiver, InMsg),
+            wait_for_accepts(1),
+            ok
     after 2000 ->
               exit(delivery_timeout)
     end,
@@ -211,6 +304,58 @@ roundtrip_quorum_queue_with_drain(Config) ->
 
     ok = amqp10_client:close_connection(Connection),
     ok.
+
+%% Send a message with a body containing a single AMQP 1.0 value section
+%% to a stream and consume via AMQP 0.9.1.
+amqp_stream_amqpl(Config) ->
+    Host = ?config(rmq_hostname, Config),
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_amqp),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, 0),
+    ContainerId = QName = atom_to_binary(?FUNCTION_NAME),
+
+    amqp_channel:call(Ch, #'queue.declare'{
+                             queue = QName,
+                             durable = true,
+                             arguments = [{<<"x-queue-type">>, longstr, <<"stream">>}]}),
+
+    Address = <<"/amq/queue/", QName/binary>>,
+    OpnConf = #{address => Host,
+                port => Port,
+                container_id => ContainerId,
+                sasl => {plain, <<"guest">>, <<"guest">>}},
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session(Connection),
+    SenderLinkName = <<"test-sender">>,
+    {ok, Sender} = amqp10_client:attach_sender_link(Session,
+                                                    SenderLinkName,
+                                                    Address),
+    wait_for_credit(Sender),
+    OutMsg = amqp10_msg:new(<<"my-tag">>, {'v1_0.amqp_value', {binary, <<0, 255>>}}, true),
+    ok = amqp10_client:send_msg(Sender, OutMsg),
+    flush("final"),
+    ok = amqp10_client:detach_link(Sender),
+    ok = amqp10_client:close_connection(Connection),
+
+    #'basic.qos_ok'{} =  amqp_channel:call(Ch, #'basic.qos'{global = false,
+                                                            prefetch_count = 1}),
+    CTag = <<"my-tag">>,
+    #'basic.consume_ok'{} = amqp_channel:subscribe(
+                              Ch,
+                              #'basic.consume'{
+                                 queue = QName,
+                                 consumer_tag = CTag,
+                                 arguments = [{<<"x-stream-offset">>, longstr, <<"first">>}]},
+                              self()),
+    receive
+        {#'basic.deliver'{consumer_tag = CTag,
+                          redelivered  = false},
+         #amqp_msg{props = #'P_basic'{type = <<"amqp-1.0">>}}} ->
+            ok
+    after 5000 ->
+              exit(basic_deliver_timeout)
+    end,
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    ok = rabbit_ct_client_helpers:close_channel(Ch).
 
 message_headers_conversion(Config) ->
     Host = ?config(rmq_hostname, Config),
@@ -240,6 +385,58 @@ message_headers_conversion(Config) ->
     delete_queue(Config, QName),
     ok = amqp10_client:close_connection(Connection),
     ok.
+
+resource_alarm(Config) ->
+    Host = ?config(rmq_hostname, Config),
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_amqp),
+    QName  = atom_to_binary(?FUNCTION_NAME, utf8),
+    Address = <<"/amq/queue/", QName/binary>>,
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName}),
+
+    OpnConf = #{address => Host,
+                port => Port,
+                container_id => atom_to_binary(?FUNCTION_NAME),
+                sasl => {plain, <<"guest">>, <<"guest">>}},
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session(Connection),
+    {ok, Sender} = create_amqp10_sender(Session, Address),
+
+    M1 = amqp10_msg:new(<<"t1">>, <<"m1">>, false),
+    M2 = amqp10_msg:new(<<"t2">>, <<"m2">>, false),
+    M3 = amqp10_msg:new(<<"t3">>, <<"m3">>, false),
+    M4 = amqp10_msg:new(<<"t4">>, <<"m4">>, false),
+
+    ok = amqp10_client:send_msg(Sender, M1),
+    ok = wait_for_settlement(<<"t1">>),
+
+    ok = rabbit_ct_broker_helpers:rpc(Config, vm_memory_monitor, set_vm_memory_high_watermark, [0]),
+    %% Let connection block.
+    timer:sleep(100),
+
+    ok = amqp10_client:send_msg(Sender, M2),
+    ok = amqp10_client:send_msg(Sender, M3),
+    ok = amqp10_client:send_msg(Sender, M4),
+
+    %% M2 still goes through, but M3 should get blocked. (Server is off by one message.)
+    receive {amqp10_disposition, {accepted, <<"t2">>}} -> ok
+    after 300 -> ct:fail({accepted_timeout, ?LINE})
+    end,
+    receive {amqp10_disposition, {accepted, <<"t3">>}} -> ct:fail("expected connection to be blocked")
+    after 300 -> ok
+    end,
+
+    %% Unblock connection.
+    ok = rabbit_ct_broker_helpers:rpc(Config, vm_memory_monitor, set_vm_memory_high_watermark, [0.4]),
+
+    %% Previously sent M3 and M4 should now be processed on the server.
+    receive {amqp10_disposition, {accepted, <<"t3">>}} -> ok
+    after 5000 -> ct:fail({accepted_timeout, ?LINE})
+    end,
+    ok = wait_for_settlement(<<"t4">>),
+
+    delete_queue(Config, QName),
+    ok = amqp10_client:close_connection(Connection).
 
 amqp10_to_amqp091_header_conversion(Session,Ch, QName, Address) -> 
     {ok, Sender} = create_amqp10_sender(Session, Address),
@@ -343,14 +540,27 @@ wait_for_credit(Sender) ->
               ct:fail(credited_timeout)
     end.
 
-wait_for_settlement(Tag) ->
+wait_for_session_end(Session) ->
     receive
-        {amqp10_disposition, {accepted, Tag}} ->
+        {amqp10_event, {session, Session, {ended, _}}} ->
+            flush(?FUNCTION_NAME),
+            ok
+    after 5000 ->
+              flush("wait_for_session_end timed out"),
+              ct:fail(settled_timeout)
+    end.
+
+wait_for_settlement(Tag) ->
+    wait_for_settlement(Tag, accepted).
+
+wait_for_settlement(Tag, State) ->
+    receive
+        {amqp10_disposition, {State, Tag}} ->
             flush(?FUNCTION_NAME),
             ok
     after 5000 ->
               flush("wait_for_settlement timed out"),
-              ct:fail(credited_timeout)
+              ct:fail({settled_timeout, Tag})
     end.
 
 wait_for_accepts(0) -> ok;
@@ -364,7 +574,7 @@ wait_for_accepts(N) ->
 
 delete_queue(Config, QName) -> 
     Ch = rabbit_ct_client_helpers:open_channel(Config, 0),
-    _ = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     rabbit_ct_client_helpers:close_channel(Ch).
 
 

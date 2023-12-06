@@ -2,7 +2,7 @@
 %% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at https://mozilla.org/MPL/2.0/.
 %%
-%% Copyright (c) 2007-2022 VMware, Inc. or its affiliates.  All rights reserved.
+%% Copyright (c) 2007-2023 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  All rights reserved.
 %%
 
 -module(amqp10_client).
@@ -87,6 +87,7 @@
 -spec open_connection(inet:socket_address() | inet:hostname(),
                       inet:port_number()) -> supervisor:startchild_ret().
 open_connection(Addr, Port) ->
+    _ = ensure_started(),
     open_connection(#{address => Addr, port => Port, notify => self(),
                       sasl => anon}).
 
@@ -97,14 +98,19 @@ open_connection(Addr, Port) ->
 -spec open_connection(connection_config()) ->
     supervisor:startchild_ret().
 open_connection(ConnectionConfig0) ->
+    _ = ensure_started(),
+
     Notify = maps:get(notify, ConnectionConfig0, self()),
     NotifyWhenOpened = maps:get(notify_when_opened, ConnectionConfig0, self()),
     NotifyWhenClosed = maps:get(notify_when_closed, ConnectionConfig0, self()),
-    amqp10_client_connection:open(ConnectionConfig0#{
+    ConnectionConfig1 = ConnectionConfig0#{
         notify => Notify,
         notify_when_opened => NotifyWhenOpened,
         notify_when_closed => NotifyWhenClosed
-    }).
+    },
+    Sasl = maps:get(sasl, ConnectionConfig1),
+    ConnectionConfig2 = ConnectionConfig1#{sasl => amqp10_client_connection:encrypt_sasl(Sasl)},
+    amqp10_client_connection:open(ConnectionConfig2).
 
 %% @doc Opens a connection using a connection_config map
 %% This is asynchronous and will notify completion to the caller using
@@ -269,7 +275,16 @@ attach_receiver_link(Session, Name, Source, SettleMode, Durability, Filter) ->
                            snd_settle_mode(), terminus_durability(), filter(),
                            properties()) ->
     {ok, link_ref()}.
-attach_receiver_link(Session, Name, Source, SettleMode, Durability, Filter, Properties) ->
+attach_receiver_link(Session, Name, Source, SettleMode, Durability, Filter, Properties)
+  when is_pid(Session) andalso
+       is_binary(Name) andalso
+       is_binary(Source) andalso
+       (SettleMode == unsettled orelse
+        SettleMode == settled orelse
+        SettleMode == mixed) andalso
+       is_atom(Durability) andalso
+       is_map(Filter) andalso
+       is_map(Properties) ->
     AttachArgs = #{name => Name,
                    role => {receiver, #{address => Source,
                                         durable => Durability}, self()},
@@ -488,6 +503,8 @@ try_to_existing_atom(L) when is_list(L) ->
             throw({non_existent_atom, L})
     end.
 
+ensure_started() ->
+    _ = application:ensure_all_started(credentials_obfuscation).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").

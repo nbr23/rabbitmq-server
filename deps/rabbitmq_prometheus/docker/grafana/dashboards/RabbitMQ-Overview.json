@@ -294,7 +294,7 @@
       "pluginVersion": "8.3.4",
       "targets": [
         {
-          "expr": "sum(rabbitmq_channels * on(instance) group_left(rabbitmq_cluster) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", job=\"${prometheus_job}\"}) - sum(rabbitmq_channel_consumers * on(instance) group_left(rabbitmq_cluster) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", job=\"${prometheus_job}\"})",
+          "expr": "sum(rabbitmq_global_publishers * on(instance) group_left(rabbitmq_cluster) rabbitmq_identity_info{rabbitmq_cluster=\"$rabbitmq_cluster\", namespace=\"$namespace\", job=\"${prometheus_job}\"})",
           "format": "time_series",
           "instant": false,
           "intervalFactor": 1,

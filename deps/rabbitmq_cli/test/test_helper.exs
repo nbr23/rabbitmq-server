@@ -2,17 +2,34 @@
 ## License, v. 2.0. If a copy of the MPL was not distributed with this
 ## file, You can obtain one at https://mozilla.org/MPL/2.0/.
 ##
-## Copyright (c) 2007-2020 VMware, Inc. or its affiliates.  All rights reserved.
+## Copyright (c) 2007-2023 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  All rights reserved.
 
-four_hours = 240 * 60 * 1000
+ten_minutes = 10 * 60 * 1000
 
 ExUnit.configure(
   exclude: [disabled: true],
-  module_load_timeout: four_hours,
-  timeout: four_hours
+  module_load_timeout: ten_minutes,
+  timeout: ten_minutes
 )
 
 ExUnit.start()
+
+# Elixir 1.15 compiler optimizations seem to require that we explicitly add to the code path
+true = Code.append_path(Path.join([System.get_env("DEPS_DIR"), "rabbit_common", "ebin"]))
+true = Code.append_path(Path.join([System.get_env("DEPS_DIR"), "rabbit", "ebin"]))
+
+true = Code.append_path(Path.join(["_build", Atom.to_string(Mix.env()), "lib", "amqp", "ebin"]))
+true = Code.append_path(Path.join(["_build", Atom.to_string(Mix.env()), "lib", "json", "ebin"]))
+true = Code.append_path(Path.join(["_build", Atom.to_string(Mix.env()), "lib", "x509", "ebin"]))
+
+if function_exported?(Mix, :ensure_application!, 1) do
+  Mix.ensure_application!(:mnesia)
+  Mix.ensure_application!(:os_mon)
+  Mix.ensure_application!(:public_key)
+  Mix.ensure_application!(:runtime_tools)
+  Mix.ensure_application!(:sasl)
+  Mix.ensure_application!(:xmerl)
+end
 
 defmodule TestHelper do
   import ExUnit.Assertions
@@ -41,8 +58,19 @@ defmodule TestHelper do
     :rpc.call(get_rabbit_hostname(), :rabbit_nodes, :cluster_name, [])
   end
 
-  def add_vhost(name) do
-    :rpc.call(get_rabbit_hostname(), :rabbit_vhost, :add, [name, "acting-user"])
+  def add_vhost(name, meta \\ %{}) do
+    :rpc.call(get_rabbit_hostname(), :rabbit_vhost, :add, [name, meta, "acting-user"])
+  end
+
+  def find_vhost(name) do
+    case :rpc.call(get_rabbit_hostname(), :rabbit_vhost, :lookup, [name]) do
+      {:error, _} = err ->
+        err
+
+      vhost_rec ->
+        {:vhost, _name, limits, meta} = vhost_rec
+        Map.merge(meta, %{name: name, limits: limits})
+    end
   end
 
   def delete_vhost(name) do
@@ -69,6 +97,13 @@ defmodule TestHelper do
     :rpc.call(get_rabbit_hostname(), :rabbit_auth_backend_internal, :add_user, [
       name,
       password,
+      "acting-user"
+    ])
+  end
+
+  def add_user_hashed_password(name, hash_password) do
+    :rpc.call(get_rabbit_hostname(), :rabbit_auth_backend_internal, :put_user, [
+      %{:name => name, :password_hash => hash_password, :tags => "administrator"},
       "acting-user"
     ])
   end
@@ -166,12 +201,22 @@ defmodule TestHelper do
     ])
   end
 
+  def set_permissions_globally(user, [conf, write, read]) do
+    :rpc.call(get_rabbit_hostname(), :rabbit_auth_backend_internal, :set_permissions_globally, [
+      user,
+      conf,
+      write,
+      read,
+      "acting-user"
+    ])
+  end
+
   def list_policies(vhost) do
     :rpc.call(get_rabbit_hostname(), :rabbit_policy, :list_formatted, [vhost])
   end
 
-  def set_policy(vhost, name, pattern, value) do
-    {:ok, decoded} = :rabbit_json.try_decode(value)
+  def set_policy(vhost, name, pattern, definition) do
+    {:ok, decoded} = :rabbit_json.try_decode(definition)
     parsed = :maps.to_list(decoded)
 
     :ok =
@@ -182,6 +227,22 @@ defmodule TestHelper do
         parsed,
         0,
         "all",
+        "acting-user"
+      ])
+  end
+
+  def set_policy(vhost, name, pattern, definition, priority, apply_to) do
+    {:ok, decoded} = :rabbit_json.try_decode(definition)
+    parsed = :maps.to_list(decoded)
+
+    :ok =
+      :rpc.call(get_rabbit_hostname(), :rabbit_policy, :set, [
+        vhost,
+        name,
+        pattern,
+        parsed,
+        priority,
+        apply_to,
         "acting-user"
       ])
   end
@@ -520,6 +581,35 @@ defmodule TestHelper do
   def expect_client_connection_failure(vhost) do
     Application.ensure_all_started(:amqp)
     assert {:error, :econnrefused} == AMQP.Connection.open(virtual_host: vhost)
+  end
+
+  def crash_queue(queue_resource = {:resource, vhost, :queue, queue_name}) do
+    node = get_rabbit_hostname()
+
+    :rabbit_misc.rpc_call(node, :rabbit_amqqueue, :kill_queue_hard, [node, queue_resource])
+
+    :ok =
+      :rabbit_misc.rpc_call(node, :rabbit_amqqueue_control, :await_state, [
+        node,
+        queue_resource,
+        :crashed
+      ])
+
+    {:existing, existing_amqqueue} = declare_queue(queue_name, vhost, true)
+    :crashed = :amqqueue.get_state(existing_amqqueue)
+  end
+
+  def stop_queue(queue_resource = {:resource, vhost, :queue, queue_name}) do
+    node = get_rabbit_hostname()
+
+    :rabbit_misc.rpc_call(node, :rabbit_amqqueue, :kill_queue_hard, [
+      node,
+      queue_resource,
+      :shutdown
+    ])
+
+    {:existing, existing_amqqueue} = declare_queue(queue_name, vhost, true)
+    :stopped = :amqqueue.get_state(existing_amqqueue)
   end
 
   def delete_all_queues() do

@@ -2,7 +2,7 @@
 %% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at https://mozilla.org/MPL/2.0/.
 %%
-%% Copyright (c) 2007-2022 VMware, Inc. or its affiliates.  All rights reserved.
+%% Copyright (c) 2007-2023 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  All rights reserved.
 %%
 
 -module(rabbit_autoheal).
@@ -119,7 +119,8 @@ init() ->
         {leader_waiting, Winner, _} ->
             rabbit_log:info(
               "Autoheal: in progress, requesting report from ~tp", [Winner]),
-            send(Winner, report_autoheal_status);
+            _ = send(Winner, report_autoheal_status),
+            ok;
         _ ->
             ok
     end,
@@ -128,7 +129,7 @@ init() ->
 maybe_start(not_healing) ->
     case enabled() of
         true  -> Leader = leader(),
-                 send(Leader, {request_start, node()}),
+                 _ = send(Leader, {request_start, node()}),
                  rabbit_log:info("Autoheal request sent to ~tp", [Leader]),
                  not_healing;
         false -> not_healing
@@ -144,7 +145,7 @@ enabled() ->
     end.
 
 leader() ->
-    [Leader | _] = lists:usort(rabbit_nodes:all()),
+    [Leader | _] = lists:usort(rabbit_nodes:list_members()),
     Leader.
 
 %% This is the winner receiving its last notification that a node has
@@ -199,6 +200,8 @@ process_down(_, State) ->
 
 %% By receiving this message we become the leader
 %% TODO should we try to debounce this?
+handle_msg({request_start, _Node}, not_healing, []) ->
+    not_healing;
 handle_msg({request_start, Node},
            not_healing, Partitions) ->
     rabbit_log:info("Autoheal request received from ~tp", [Node]),
@@ -216,7 +219,7 @@ handle_msg({request_start, Node},
             case node() =:= Winner of
                 true  -> handle_msg({become_winner, Losers},
                                     not_healing, Partitions);
-                false -> send(Winner, {become_winner, Losers}),
+                false -> _ = send(Winner, {become_winner, Losers}),
                          {leader_waiting, Winner, Losers}
             end
     end;
@@ -260,6 +263,12 @@ handle_msg({winner_is, Winner}, State = {leader_waiting, Winner, _},
     %% This node is the leader and a loser at the same time.
     Pid = restart_loser(State, Winner),
     {restarting, Pid};
+handle_msg({winner_is, Winner}, State = {winner_waiting, _OutstandingStops, _Notify},
+           _Partitions) ->
+    %% This node is still in winner_waiting with a winner reported, restart loser
+    %% and update state
+    Pid = restart_loser(State, Winner),
+    {restarting, Pid};
 
 handle_msg(Request, {restarting, Pid} = St, _Partitions) ->
     %% ignore, we can contribute no further
@@ -272,7 +281,7 @@ handle_msg(report_autoheal_status, not_healing, _Partitions) ->
     %% winner). This happens when the leader is a loser and it just
     %% restarted. We are in the "not_healing" state, so the previous
     %% autoheal process ended: let's tell this to the leader.
-    send(leader(), {autoheal_finished, node()}),
+    _ = send(leader(), {autoheal_finished, node()}),
     not_healing;
 
 handle_msg(report_autoheal_status, State, _Partitions) ->
@@ -329,7 +338,7 @@ winner_finish(Notify) ->
     %% losing nodes before sending the "autoheal_safe_to_start" signal.
     wait_for_mnesia_shutdown(Notify),
     [{rabbit_outside_app_process, N} ! autoheal_safe_to_start || N <- Notify],
-    send(leader(), {autoheal_finished, node()}),
+    _ = send(leader(), {autoheal_finished, node()}),
     not_healing.
 
 %% This improves the previous implementation, but could still potentially enter an infinity
@@ -355,7 +364,7 @@ wait_for_supervisors(Monitors) ->
 		    AliveLosers = [Node || {_, Node} <- pmon:monitored(Monitors)],
 		    rabbit_log:info("Autoheal: mnesia in nodes ~tp is still up, sending "
 				    "winner notification again to these ", [AliveLosers]),
-		    [send(L, {winner_is, node()}) || L <- AliveLosers],
+		    _ = [send(L, {winner_is, node()}) || L <- AliveLosers],
 		    wait_for_mnesia_shutdown(AliveLosers)
 	    end
     end.
@@ -410,7 +419,7 @@ partition_value(Partition) ->
 %% only know which nodes we have been partitioned from, not which
 %% nodes are partitioned from each other.
 check_other_nodes(LocalPartitions) ->
-    Nodes = rabbit_nodes:all(),
+    Nodes = rabbit_nodes:list_members(),
     {Results, Bad} = rabbit_node_monitor:status(Nodes -- [node()]),
     RemotePartitions = [{Node, proplists:get_value(partitions, Res)}
                         || {Node, Res} <- Results],
@@ -449,7 +458,7 @@ stop_partition(Losers) ->
     %% give up.
     Down = Losers -- rabbit_node_monitor:alive_rabbit_nodes(Losers),
     case Down of
-        [] -> [send(L, {winner_is, node()}) || L <- Losers],
+        [] -> _ = [send(L, {winner_is, node()}) || L <- Losers],
               {winner_waiting, Losers, Losers};
         _  -> abort(Down, Losers)
     end.

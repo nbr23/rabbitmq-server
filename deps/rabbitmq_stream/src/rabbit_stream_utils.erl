@@ -11,26 +11,31 @@
 %% The Original Code is RabbitMQ.
 %%
 %% The Initial Developer of the Original Code is Pivotal Software, Inc.
-%% Copyright (c) 2020-2022 VMware, Inc. or its affiliates.  All rights reserved.
+%% Copyright (c) 2020-2023 VMware, Inc. or its affiliates.  All rights reserved.
 %%
 
 -module(rabbit_stream_utils).
 
+-feature(maybe_expr, enable).
+
 %% API
 -export([enforce_correct_name/1,
-         write_messages/4,
+         write_messages/5,
          parse_map/2,
          auth_mechanisms/1,
          auth_mechanism_to_module/2,
-         check_configure_permitted/3,
-         check_write_permitted/3,
+         check_configure_permitted/2,
+         check_write_permitted/2,
          check_read_permitted/3,
          extract_stream_list/2,
          sort_partitions/1,
          strip_cr_lf/1,
-         is_sac_ff_enabled/0,
          consumer_activity_status/2,
-         command_versions/0]).
+         filter_defined/1,
+         filter_spec/1,
+         command_versions/0,
+         filtering_supported/0,
+         check_super_stream_management_permitted/4]).
 
 -define(MAX_PERMISSION_CACHE_SIZE, 12).
 
@@ -55,49 +60,9 @@ check_name(<<"">>) ->
 check_name(_Name) ->
     ok.
 
-write_messages(_ClusterLeader, undefined, _PublisherId, <<>>) ->
+write_messages(_Version, _ClusterLeader, _PublisherRef, _PublisherId, <<>>) ->
     ok;
-write_messages(ClusterLeader,
-               undefined,
-               PublisherId,
-               <<PublishingId:64,
-                 0:1,
-                 MessageSize:31,
-                 Message:MessageSize/binary,
-                 Rest/binary>>) ->
-    % FIXME handle write error
-    ok =
-        osiris:write(ClusterLeader,
-                     undefined,
-                     {PublisherId, PublishingId},
-                     Message),
-    write_messages(ClusterLeader, undefined, PublisherId, Rest);
-write_messages(ClusterLeader,
-               undefined,
-               PublisherId,
-               <<PublishingId:64,
-                 1:1,
-                 CompressionType:3,
-                 _Unused:4,
-                 MessageCount:16,
-                 UncompressedSize:32,
-                 BatchSize:32,
-                 Batch:BatchSize/binary,
-                 Rest/binary>>) ->
-    % FIXME handle write error
-    ok =
-        osiris:write(ClusterLeader,
-                     undefined,
-                     {PublisherId, PublishingId},
-                     {batch,
-                      MessageCount,
-                      CompressionType,
-                      UncompressedSize,
-                      Batch}),
-    write_messages(ClusterLeader, undefined, PublisherId, Rest);
-write_messages(_ClusterLeader, _PublisherRef, _PublisherId, <<>>) ->
-    ok;
-write_messages(ClusterLeader,
+write_messages(?VERSION_1 = V, ClusterLeader,
                PublisherRef,
                PublisherId,
                <<PublishingId:64,
@@ -105,10 +70,9 @@ write_messages(ClusterLeader,
                  MessageSize:31,
                  Message:MessageSize/binary,
                  Rest/binary>>) ->
-    % FIXME handle write error
-    ok = osiris:write(ClusterLeader, PublisherRef, PublishingId, Message),
-    write_messages(ClusterLeader, PublisherRef, PublisherId, Rest);
-write_messages(ClusterLeader,
+    write_messages0(V, ClusterLeader, PublisherRef, PublisherId,
+                    PublishingId, Message, Rest);
+write_messages(?VERSION_1 = V, ClusterLeader,
                PublisherRef,
                PublisherId,
                <<PublishingId:64,
@@ -120,17 +84,39 @@ write_messages(ClusterLeader,
                  BatchSize:32,
                  Batch:BatchSize/binary,
                  Rest/binary>>) ->
-    % FIXME handle write error
-    ok =
-        osiris:write(ClusterLeader,
-                     PublisherRef,
-                     PublishingId,
-                     {batch,
-                      MessageCount,
-                      CompressionType,
-                      UncompressedSize,
-                      Batch}),
-    write_messages(ClusterLeader, PublisherRef, PublisherId, Rest).
+    Data = {batch, MessageCount, CompressionType, UncompressedSize, Batch},
+    write_messages0(V, ClusterLeader, PublisherRef, PublisherId,
+                    PublishingId, Data, Rest);
+write_messages(?VERSION_2 = V, ClusterLeader,
+               PublisherRef,
+               PublisherId,
+               <<PublishingId:64,
+                 -1:16/signed,
+                 0:1,
+                 MessageSize:31,
+                 Message:MessageSize/binary,
+                 Rest/binary>>) ->
+    write_messages0(V, ClusterLeader, PublisherRef, PublisherId,
+                    PublishingId, Message, Rest);
+write_messages(?VERSION_2 = V, ClusterLeader,
+               PublisherRef,
+               PublisherId,
+               <<PublishingId:64,
+                 FilterValueLength:16, FilterValue:FilterValueLength/binary,
+                 0:1,
+                 MessageSize:31,
+                 Message:MessageSize/binary,
+                 Rest/binary>>) ->
+    write_messages0(V, ClusterLeader, PublisherRef, PublisherId,
+                    PublishingId, {FilterValue, Message}, Rest).
+
+write_messages0(Vsn, ClusterLeader, PublisherRef, PublisherId, PublishingId, Data, Rest) ->
+    Corr = case PublisherRef of
+               undefined -> {PublisherId, PublishingId};
+               _ -> PublishingId
+           end,
+    ok = osiris:write(ClusterLeader, PublisherRef, Corr, Data),
+    write_messages(Vsn, ClusterLeader, PublisherRef, PublisherId, Rest).
 
 parse_map(<<>>, _Count) ->
     {#{}, <<>>};
@@ -207,14 +193,48 @@ check_resource_access(User, Resource, Perm, Context) ->
             end
     end.
 
-check_configure_permitted(Resource, User, Context) ->
-    check_resource_access(User, Resource, configure, Context).
+check_configure_permitted(Resource, User) ->
+    check_resource_access(User, Resource, configure, #{}).
 
-check_write_permitted(Resource, User, Context) ->
-    check_resource_access(User, Resource, write, Context).
+check_write_permitted(Resource, User) ->
+    check_resource_access(User, Resource, write, #{}).
 
 check_read_permitted(Resource, User, Context) ->
     check_resource_access(User, Resource, read, Context).
+
+-spec check_super_stream_management_permitted(rabbit_types:vhost(), binary(), [binary()], rabbit_types:user()) ->
+    ok | error.
+check_super_stream_management_permitted(VirtualHost, SuperStream, Partitions, User) ->
+    Exchange = e(VirtualHost, SuperStream),
+    maybe
+        %% exchange creation
+        ok ?= check_configure_permitted(Exchange, User),
+        %% stream creations
+        ok ?= check_streams_permissions(fun check_configure_permitted/2,
+                                        VirtualHost, Partitions,
+                                        User),
+        %% binding from exchange
+        ok ?= check_read_permitted(Exchange, User, #{}),
+        %% binding to streams
+        check_streams_permissions(fun check_write_permitted/2,
+                                  VirtualHost, Partitions,
+                                  User)
+    end.
+
+check_streams_permissions(Fun, VirtualHost, List, User) ->
+    case lists:all(fun(S) ->
+                      case Fun(q(VirtualHost, S), User) of
+                          ok ->
+                              true;
+                          _ ->
+                              false
+                      end
+              end, List) of
+        true ->
+            ok;
+        _ ->
+            error
+    end.
 
 extract_stream_list(<<>>, Streams) ->
     Streams;
@@ -245,9 +265,6 @@ sort_partitions(Partitions) ->
 strip_cr_lf(NameBin) ->
     binary:replace(NameBin, [<<"\n">>, <<"\r">>], <<"">>, [global]).
 
-is_sac_ff_enabled() ->
-    rabbit_feature_flags:is_enabled(stream_single_active_consumer).
-
 consumer_activity_status(Active, Properties) ->
     case {rabbit_stream_reader:single_active_consumer(Properties), Active}
     of
@@ -259,9 +276,44 @@ consumer_activity_status(Active, Properties) ->
             waiting
     end.
 
+filter_defined(SubscriptionProperties) when is_map(SubscriptionProperties) ->
+    lists:any(fun(<<"filter.",_/binary>>) ->
+                      true;
+                 (_) ->
+                      false
+              end, maps:keys(SubscriptionProperties));
+filter_defined(_) ->
+    false.
+
+filter_spec(Properties) ->
+    Filters = maps:fold(fun(<<"filter.",_/binary>>, V, Acc) ->
+                                [V] ++ Acc;
+                           (_, _, Acc) ->
+                                Acc
+                        end, [], Properties),
+    case Filters of
+        [] ->
+            #{};
+        _ ->
+            MatchUnfiltered = case Properties of
+                                  #{<<"match-unfiltered">> := <<"true">>} ->
+                                      true;
+                                  _ ->
+                                      false
+                              end,
+            #{filter_spec =>
+              #{filters => Filters, match_unfiltered => MatchUnfiltered}}
+    end.
+
 command_versions() ->
+    PublishMaxVersion = case filtering_supported() of
+                            false ->
+                                ?VERSION_1;
+                            true ->
+                                ?VERSION_2
+                        end,
     [{declare_publisher, ?VERSION_1, ?VERSION_1},
-     {publish, ?VERSION_1, ?VERSION_1},
+     {publish, ?VERSION_1, PublishMaxVersion},
      {query_publisher_sequence, ?VERSION_1, ?VERSION_1},
      {delete_publisher, ?VERSION_1, ?VERSION_1},
      {subscribe, ?VERSION_1, ?VERSION_1},
@@ -276,4 +328,15 @@ command_versions() ->
      {heartbeat, ?VERSION_1, ?VERSION_1},
      {route, ?VERSION_1, ?VERSION_1},
      {partitions, ?VERSION_1, ?VERSION_1},
-     {stream_stats, ?VERSION_1, ?VERSION_1}].
+     {stream_stats, ?VERSION_1, ?VERSION_1},
+     {create_super_stream, ?VERSION_1, ?VERSION_1},
+     {delete_super_stream, ?VERSION_1, ?VERSION_1}].
+
+filtering_supported() ->
+    rabbit_feature_flags:is_enabled(stream_filtering).
+
+q(VirtualHost, Name) ->
+    rabbit_misc:r(VirtualHost, queue, Name).
+
+e(VirtualHost, Name) ->
+    rabbit_misc:r(VirtualHost, exchange, Name).

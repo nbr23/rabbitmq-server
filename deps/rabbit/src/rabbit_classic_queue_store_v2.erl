@@ -2,7 +2,7 @@
 %% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at https://mozilla.org/MPL/2.0/.
 %%
-%% Copyright (c) 2007-2022 VMware, Inc. or its affiliates.  All rights reserved.
+%% Copyright (c) 2007-2023 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  All rights reserved.
 %%
 
 %% The classic queue store works as follow:
@@ -71,12 +71,13 @@
 
 -type buffer() :: #{
     %% SeqId => {Offset, Size, Msg}
-    rabbit_variable_queue:seq_id() => {non_neg_integer(), non_neg_integer(), #basic_message{}}
+                    rabbit_variable_queue:seq_id() => {non_neg_integer(), non_neg_integer(), mc:state()}
 }.
 
 -record(qs, {
     %% Store directory - same as the queue index.
-    dir :: file:filename(),
+    %% Stored as binary() as opposed to file:filename() to save memory.
+    dir :: binary(),
 
     %% We keep track of which segment is open
     %% and the current offset in the file. This offset
@@ -117,7 +118,7 @@ init(#resource{ virtual_host = VHost } = Name) ->
     ?DEBUG("~0p", [Name]),
     VHostDir = rabbit_vhost:msg_store_dir_path(VHost),
     Dir = rabbit_classic_queue_index_v2:queue_dir(VHostDir, Name),
-    #qs{dir = Dir}.
+    #qs{dir = rabbit_file:filename_to_binary(Dir)}.
 
 -spec terminate(State) -> State when State::state().
 
@@ -141,7 +142,7 @@ maybe_close_fd(Fd) ->
 info(#qs{ write_buffer = WriteBuffer }) ->
     [{qs_buffer_size, map_size(WriteBuffer)}].
 
--spec write(rabbit_variable_queue:seq_id(), rabbit_types:basic_message(),
+-spec write(rabbit_variable_queue:seq_id(), mc:state(),
             rabbit_types:message_properties(), State)
         -> {msg_location(), State} when State::state().
 
@@ -282,7 +283,7 @@ build_data({_, Size, Msg}, CheckCRC32) ->
     ].
 
 -spec read(rabbit_variable_queue:seq_id(), msg_location(), State)
-        -> {rabbit_types:basic_message(), State} when State::state().
+        -> {mc:state(), State} when State::state().
 
 read(SeqId, DiskLocation, State = #qs{ write_buffer = WriteBuffer,
                                        cache = Cache }) ->
@@ -327,7 +328,7 @@ read_from_disk(SeqId, {?MODULE, Offset, Size}, State0) ->
     {Msg, State}.
 
 -spec read_many([{rabbit_variable_queue:seq_id(), msg_location()}], State)
-        -> {[rabbit_types:basic_message()], State} when State::state().
+        -> {[mc:state()], State} when State::state().
 
 read_many([], State) ->
     {[], State};
@@ -444,7 +445,7 @@ get_read_fd(Segment, State = #qs{ read_fd = OldFd }) ->
                 eof ->
                     %% Something is wrong with the file. Close it
                     %% and let the caller decide what to do with it.
-                    file:close(Fd),
+                    _ = file:close(Fd),
                     {{error, bad_header}, State#qs{ read_segment = undefined,
                                                     read_fd = undefined }}
             end;
@@ -570,4 +571,5 @@ check_crc32() ->
 %% Same implementation as rabbit_classic_queue_index_v2:segment_file/2,
 %% but with a different state record.
 segment_file(Segment, #qs{ dir = Dir }) ->
-    filename:join(Dir, integer_to_list(Segment) ++ ?SEGMENT_EXTENSION).
+    filename:join(rabbit_file:binary_to_filename(Dir),
+                  integer_to_list(Segment) ++ ?SEGMENT_EXTENSION).

@@ -386,14 +386,14 @@ start-brokers start-cluster: $(DIST_TARGET)
 		  -rabbitmq_web_stomp_examples listener [{port,$$((61633 + $$n - 1))}] \
 		  -rabbitmq_prometheus tcp_config [{port,$$((15692 + $$n - 1))}] \
 		  -rabbitmq_stream tcp_listeners [$$((5552 + $$n - 1))] \
-		  "; \
+		  " & \
+	done; \
+	wait && \
+	for n in $$(seq $(NODES)); do \
+		nodename="rabbit-$$n@$(HOSTNAME)"; \
 		if test '$@' = 'start-cluster' && test "$$nodename1"; then \
 			ERL_LIBS="$(DIST_ERL_LIBS)" \
-			  $(RABBITMQCTL) -n "$$nodename" stop_app; \
-			ERL_LIBS="$(DIST_ERL_LIBS)" \
 			  $(RABBITMQCTL) -n "$$nodename" join_cluster "$$nodename1"; \
-			ERL_LIBS="$(DIST_ERL_LIBS)" \
-			  $(RABBITMQCTL) -n "$$nodename" start_app; \
 		else \
 			nodename1=$$nodename; \
 		fi; \
@@ -403,8 +403,9 @@ stop-brokers stop-cluster:
 	@for n in $$(seq $(NODES) -1 1); do \
 		nodename="rabbit-$$n@$(HOSTNAME)"; \
 		$(MAKE) stop-node \
-		  RABBITMQ_NODENAME="$$nodename"; \
-	done
+		  RABBITMQ_NODENAME="$$nodename" & \
+	done; \
+	wait
 
 # --------------------------------------------------------------------
 # Used by testsuites.

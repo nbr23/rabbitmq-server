@@ -2,7 +2,7 @@
 %% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at https://mozilla.org/MPL/2.0/.
 %%
-%% Copyright (c) 2010-2022 VMware, Inc. or its affiliates.  All rights reserved.
+%% Copyright (c) 2010-2023 VMware, Inc. or its affiliates.  All rights reserved.
 %%
 
 -module(rabbit_mirror_queue_sync).
@@ -133,7 +133,8 @@ bq_fold(FoldFun, FoldAcc, Args, BQ, BQS) ->
 append_to_acc(Msg, MsgProps, Unacked, {Batch, I, {_, _, 0}, {Curr, Len}, T}) ->
     {[{Msg, MsgProps, Unacked} | Batch], I, {0, 0, 0}, {Curr + 1, Len}, T};
 append_to_acc(Msg, MsgProps, Unacked, {Batch, I, {TotalBytes, LastCheck, SyncThroughput}, {Curr, Len}, T}) ->
-    {[{Msg, MsgProps, Unacked} | Batch], I, {TotalBytes + rabbit_basic:msg_size(Msg), LastCheck, SyncThroughput}, {Curr + 1, Len}, T}.
+    {_, MsgSize} = mc:size(Msg),
+    {[{Msg, MsgProps, Unacked} | Batch], I, {TotalBytes + MsgSize, LastCheck, SyncThroughput}, {Curr + 1, Len}, T}.
 
 master_send_receive(SyncMsg, NewAcc, Syncer, Ref, Parent) ->
     receive
@@ -256,7 +257,7 @@ await_slaves(Ref, SPids) ->
 %% down.
 
 syncer_check_resources(Ref, MPid, SPids) ->
-    rabbit_alarm:register(self(), {?MODULE, conserve_resources, []}),
+    _ = rabbit_alarm:register(self(), {?MODULE, conserve_resources, []}),
     %% Before we ask the master node to send the first batch of messages
     %% over here, we check if one node is already short on memory. If
     %% that's the case, we wait for the alarm to be cleared before
@@ -295,7 +296,7 @@ syncer_loop(Ref, MPid, SPids) ->
                     % Die silently because there are no mirrors left.
                     ok;
                 _  ->
-                    broadcast(SPids1, {sync_msgs, Ref, Msgs}),
+                    _ = broadcast(SPids1, {sync_msgs, Ref, Msgs}),
                     MPid ! {next, Ref},
                     syncer_loop(Ref, MPid, SPids1)
             end;
@@ -314,6 +315,9 @@ broadcast(SPids, Msg) ->
          SPid ! Msg
      end || SPid <- SPids].
 
+-spec conserve_resources(pid(),
+                         rabbit_alarm:resource_alarm_source(),
+                         rabbit_alarm:resource_alert()) -> ok.
 conserve_resources(Pid, Source, {_, Conserve, _}) ->
     Pid ! {conserve_resources, Source, Conserve},
     ok.

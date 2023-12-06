@@ -2,7 +2,7 @@
 %% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at https://mozilla.org/MPL/2.0/.
 %%
-%% Copyright (c) 2007-2022 VMware, Inc. or its affiliates.  All rights reserved.
+%% Copyright (c) 2007-2023 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  All rights reserved.
 %%
 
 -module(rabbit_ct_broker_helpers).
@@ -25,6 +25,8 @@
     rewrite_node_config_file/2,
     cluster_nodes/1, cluster_nodes/2,
 
+    setup_meck/1,
+
     get_node_configs/1, get_node_configs/2,
     get_node_config/2, get_node_config/3, set_node_config/3,
     nodename_to_index/2,
@@ -36,10 +38,12 @@
 
     add_code_path_to_node/2,
     add_code_path_to_all_nodes/2,
-    rpc/5, rpc/6,
+    rpc/4, rpc/5, rpc/6,
     rpc_all/4, rpc_all/5,
 
     start_node/2,
+    async_start_node/2,
+    wait_for_async_start_node/1,
     start_broker/2,
     restart_broker/2,
     stop_broker/2,
@@ -59,6 +63,7 @@
 
     is_feature_flag_supported/2,
     is_feature_flag_supported/3,
+    is_feature_flag_enabled/2,
     enable_feature_flag/2,
     enable_feature_flag/3,
 
@@ -166,7 +171,9 @@
 
     test_channel/0,
     test_writer/1,
-    user/1
+    user/1,
+
+    configured_metadata_store/1
   ]).
 
 %% Internal functions exported to be used by rpc:call/4.
@@ -175,7 +182,7 @@
   ]).
 
 -define(DEFAULT_USER, "guest").
--define(NODE_START_ATTEMPTS, 10).
+-define(NODE_START_ATTEMPTS, 3).
 
 -define(TCP_PORTS_BASE, 21000).
 -define(TCP_PORTS_LIST, [
@@ -187,6 +194,7 @@
     tcp_port_mqtt,
     tcp_port_mqtt_tls,
     tcp_port_web_mqtt,
+    tcp_port_web_mqtt_tls,
     tcp_port_stomp,
     tcp_port_stomp_tls,
     tcp_port_web_stomp,
@@ -210,7 +218,8 @@ setup_steps() ->
                 fun rabbit_ct_helpers:ensure_rabbitmq_plugins_cmd/1,
                 fun set_lager_flood_limit/1,
                 fun start_rabbitmq_nodes/1,
-                fun share_dist_and_proxy_ports_map/1
+                fun share_dist_and_proxy_ports_map/1,
+                fun configure_metadata_store/1
             ];
         _ ->
             [
@@ -219,7 +228,8 @@ setup_steps() ->
                 fun rabbit_ct_helpers:ensure_rabbitmq_plugins_cmd/1,
                 fun set_lager_flood_limit/1,
                 fun start_rabbitmq_nodes/1,
-                fun share_dist_and_proxy_ports_map/1
+                fun share_dist_and_proxy_ports_map/1,
+                fun configure_metadata_store/1
             ]
     end.
 
@@ -511,6 +521,9 @@ update_tcp_ports_in_rmq_config(NodeConfig, [tcp_port_mqtt_tls = Key | Rest]) ->
     NodeConfig1 = rabbit_ct_helpers:merge_app_env(NodeConfig,
       {rabbitmq_mqtt, [{ssl_listeners, [?config(Key, NodeConfig)]}]}),
     update_tcp_ports_in_rmq_config(NodeConfig1, Rest);
+update_tcp_ports_in_rmq_config(NodeConfig, [tcp_port_web_mqtt_tls | Rest]) ->
+    %% Skip this one, because we need more than just a port to configure
+    update_tcp_ports_in_rmq_config(NodeConfig, Rest);
 update_tcp_ports_in_rmq_config(NodeConfig, [tcp_port_web_mqtt = Key | Rest]) ->
     NodeConfig1 = rabbit_ct_helpers:merge_app_env(NodeConfig,
       {rabbitmq_web_mqtt, [{tcp_config, [{port, ?config(Key, NodeConfig)}]}]}),
@@ -633,6 +646,7 @@ do_start_rabbitmq_node(Config, NodeConfig, I) ->
     InitialNodename = ?config(initial_nodename, NodeConfig),
     DistPort = ?config(tcp_port_erlang_dist, NodeConfig),
     ConfigFile = ?config(erlang_node_config_filename, NodeConfig),
+    AdditionalErlArgs = rabbit_ct_helpers:get_config(Config, additional_erl_args, []),
     %% Use inet_proxy_dist to handle distribution. This is used by the
     %% partitions testsuite.
     DistMod = rabbit_ct_helpers:get_config(Config, erlang_dist_module),
@@ -729,7 +743,7 @@ do_start_rabbitmq_node(Config, NodeConfig, I) ->
       {"RABBITMQ_DIST_PORT=~b", [DistPort]},
       {"RABBITMQ_CONFIG_FILE=~ts", [ConfigFile]},
       {"RABBITMQ_SERVER_START_ARGS=~ts", [StartArgs1]},
-      "RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=+S 2 +sbwt very_short +A 24",
+      {"RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=+S 2 +sbwt very_short +A 24 ~ts", [AdditionalErlArgs]},
       "RABBITMQ_LOG=debug",
       "RMQCTL_WAIT_TIMEOUT=180",
       {"TEST_TMPDIR=~ts", [PrivDir]}
@@ -785,10 +799,12 @@ query_node(Config, NodeConfig) ->
       [rabbit, plugins_dir]),
     {ok, EnabledPluginsFile} = rpc(Config, Nodename, application, get_env,
       [rabbit, enabled_plugins_file]),
+    LogLocations = rpc(Config, Nodename, rabbit, log_locations, []),
     Vars0 = [{pid_file, PidFile},
              {data_dir, DataDir},
              {plugins_dir, PluginsDir},
-             {enabled_plugins_file, EnabledPluginsFile}],
+             {enabled_plugins_file, EnabledPluginsFile},
+             {log_locations, LogLocations}],
     Vars = try
                EnabledFeatureFlagsFile = rpc(Config, Nodename,
                                              rabbit_feature_flags,
@@ -920,6 +936,54 @@ share_dist_and_proxy_ports_map(Config) ->
       application, set_env, [kernel, dist_and_proxy_ports_map, Map]),
     Config.
 
+configured_metadata_store(Config) ->
+    case rabbit_ct_helpers:get_config(Config, metadata_store) of
+        khepri ->
+            {khepri, []};
+        {khepri, _FFs0} = Khepri ->
+            Khepri;
+        mnesia ->
+            mnesia;
+        _ ->
+            case os:getenv("RABBITMQ_METADATA_STORE") of
+                "khepri" ->
+                    {khepri, []};
+                _ ->
+                    mnesia
+            end
+    end.
+
+configure_metadata_store(Config) ->
+    ct:pal("Configuring metadata store..."),
+    case configured_metadata_store(Config) of
+        {khepri, FFs0} ->
+            case enable_khepri_metadata_store(Config, FFs0) of
+                {skip, _} = Skip ->
+                    _ = stop_rabbitmq_nodes(Config),
+                    Skip;
+                Config1 ->
+                    Config1
+            end;
+        mnesia ->
+            ct:pal("Enabling Mnesia metadata store"),
+            Config
+    end.
+
+enable_khepri_metadata_store(Config, FFs0) ->
+    ct:pal("Enabling Khepri metadata store"),
+    FFs = [khepri_db | FFs0],
+    lists:foldl(fun(_FF, {skip, _Reason} = Skip) ->
+                        Skip;
+                   (FF, C) ->
+                        case enable_feature_flag(C, FF) of
+                            ok ->
+                                C;
+                            Skip ->
+                                ct:pal("Enabling metadata store failed: ~p", [Skip]),
+                                Skip
+                        end
+                end, Config, FFs).
+
 rewrite_node_config_file(Config, Node) ->
     NodeConfig = get_node_config(Config, Node),
     I = if
@@ -1000,6 +1064,31 @@ stop_rabbitmq_nodes(Config) ->
           fun(NodeConfig) ->
                   stop_rabbitmq_node(Config, NodeConfig)
           end),
+    %% Except if disabled, we search for crashes logged in the test nodes after
+    %% they are stopped. If we find some, we log them again in the common_test
+    %% logs and throw an exception to make the test fail.
+    FindCrashes = case rabbit_ct_helpers:get_config(Config, find_crashes) of
+                      true ->
+                          true;
+                      false ->
+                          false;
+                      undefined ->
+                          case os:getenv("FIND_CRASHES") of
+                              false  -> true;
+                              "1"    -> true;
+                              "yes"  -> true;
+                              "true" -> true;
+                              _      -> false
+                          end
+                  end,
+    case FindCrashes of
+        true ->
+            %% TODO: Make the ignore list configurable.
+            IgnoredCrashes = ["** force_vhost_failure"],
+            find_crashes_in_logs(NodeConfigs, IgnoredCrashes);
+        false ->
+            ok
+    end,
     proplists:delete(rmq_nodes, Config).
 
 stop_rabbitmq_node(Config, NodeConfig) ->
@@ -1020,6 +1109,84 @@ stop_rabbitmq_node(Config, NodeConfig) ->
             rabbit_ct_helpers:exec([RunCmd | Cmd])
     end,
     NodeConfig.
+
+find_crashes_in_logs(NodeConfigs, IgnoredCrashes) ->
+    ct:pal(
+      "Looking up any crash reports in the nodes' log files. If we find "
+      "some, they will appear below:"),
+    CrashesCount = lists:foldl(
+                     fun(NodeConfig, Total) ->
+                             Count = count_crashes_in_logs(
+                                       NodeConfig, IgnoredCrashes),
+                             Total + Count
+                     end, 0, NodeConfigs),
+    ct:pal("Found ~b crash report(s)", [CrashesCount]),
+    ?assertEqual(0, CrashesCount).
+
+count_crashes_in_logs(NodeConfig, IgnoredCrashes) ->
+    LogLocations = ?config(log_locations, NodeConfig),
+    lists:foldl(
+      fun(LogLocation, Total) ->
+              Count = count_crashes_in_log(LogLocation, IgnoredCrashes),
+              Total + Count
+      end, 0, LogLocations).
+
+count_crashes_in_log(LogLocation, IgnoredCrashes) ->
+    case file:read_file(LogLocation) of
+        {ok, Content} -> count_crashes_in_content(Content, IgnoredCrashes);
+        _             -> 0
+    end.
+
+count_crashes_in_content(Content, IgnoredCrashes) ->
+    ReOpts = [multiline],
+    Lines = re:split(Content, "^", ReOpts),
+    count_gen_server_terminations(Lines, IgnoredCrashes).
+
+count_gen_server_terminations(Lines, IgnoredCrashes) ->
+    count_gen_server_terminations(Lines, 0, IgnoredCrashes).
+
+count_gen_server_terminations([Line | Rest], Count, IgnoredCrashes) ->
+    ReOpts = [{capture, all_but_first, list}],
+    Ret = re:run(
+            Line,
+            "(<[0-9.]+> )[*]{2} Generic server .+ terminating$",
+            ReOpts),
+    case Ret of
+        {match, [Prefix]} ->
+            capture_gen_server_termination(
+              Rest, Prefix, [Line], Count, IgnoredCrashes);
+        nomatch ->
+            count_gen_server_terminations(Rest, Count, IgnoredCrashes)
+    end;
+count_gen_server_terminations([], Count, _IgnoredCrashes) ->
+    Count.
+
+capture_gen_server_termination(
+  [Line | Rest] = Lines, Prefix, Acc, Count, IgnoredCrashes) ->
+    ReOpts = [{capture, all_but_first, list}],
+    Ret = re:run(Line, Prefix ++ "( .*|\\*.*|)$", ReOpts),
+    case Ret of
+        {match, [Suffix]} ->
+            case lists:member(Suffix, IgnoredCrashes) of
+                false ->
+                    capture_gen_server_termination(
+                      Rest, Prefix, [Line | Acc], Count, IgnoredCrashes);
+                true ->
+                    count_gen_server_terminations(
+                      Lines, Count, IgnoredCrashes)
+            end;
+        nomatch ->
+            found_gen_server_termiation(
+              lists:reverse(Acc), Lines, Count, IgnoredCrashes)
+    end;
+capture_gen_server_termination(
+  [] = Rest, _Prefix, Acc, Count, IgnoredCrashes) ->
+    found_gen_server_termiation(
+      lists:reverse(Acc), Rest, Count, IgnoredCrashes).
+
+found_gen_server_termiation(Message, Lines, Count, IgnoredCrashes) ->
+    ct:pal("gen_server termination:~n~n~s", [Message]),
+    count_gen_server_terminations(Lines, Count + 1, IgnoredCrashes).
 
 %% -------------------------------------------------------------------
 %% Helpers for partition simulation
@@ -1072,7 +1239,60 @@ rabbitmqctl(Config, Node, Args) ->
     rabbitmqctl(Config, Node, Args, infinity).
 
 rabbitmqctl(Config, Node, Args, Timeout) ->
-    Rabbitmqctl = ?config(rabbitmqctl_cmd, Config),
+    %% We want to use the CLI from the given node if there is a secondary
+    %% umbrella being configured.
+    I = get_node_index(Config, Node),
+    CanUseSecondary = (I + 1) rem 2 =:= 0,
+    BazelRunSecCmd = rabbit_ct_helpers:get_config(
+                       Config, rabbitmq_run_secondary_cmd),
+    UseSecondaryUmbrella = case ?config(secondary_umbrella, Config) of
+                               false ->
+                                   case BazelRunSecCmd of
+                                       undefined -> false;
+                                       _         -> CanUseSecondary
+                                   end;
+                               _ ->
+                                   CanUseSecondary
+                           end,
+    Rabbitmqctl = case UseSecondaryUmbrella of
+                      true ->
+                          case BazelRunSecCmd of
+                              undefined ->
+                                  SrcDir = ?config(
+                                              secondary_rabbit_srcdir,
+                                              Config),
+                                  SecDepsDir = ?config(
+                                                  secondary_erlang_mk_depsdir,
+                                                  Config),
+                                  SecNewScriptsDir = filename:join(
+                                                       [SecDepsDir,
+                                                        SrcDir,
+                                                        "sbin"]),
+                                  SecOldScriptsDir = filename:join(
+                                                       [SecDepsDir,
+                                                        "rabbit",
+                                                        "scripts"]),
+                                  SecNewScriptsDirExists = filelib:is_dir(
+                                                             SecNewScriptsDir),
+                                  SecScriptsDir =
+                                  case SecNewScriptsDirExists of
+                                      true  -> SecNewScriptsDir;
+                                      false -> SecOldScriptsDir
+                                  end,
+                                  rabbit_misc:format(
+                                    "~ts/rabbitmqctl", [SecScriptsDir]);
+                              _ ->
+                                  BazelSecScriptsDir = filename:dirname(
+                                                         BazelRunSecCmd),
+                                  filename:join(
+                                    [BazelSecScriptsDir,
+                                     "sbin",
+                                     "rabbitmqctl"])
+                          end;
+                      false ->
+                          ?config(rabbitmqctl_cmd, Config)
+                  end,
+
     NodeConfig = get_node_config(Config, Node),
     Nodename = ?config(nodename, NodeConfig),
     Env0 = [
@@ -1129,6 +1349,23 @@ rabbitmq_queues(Config, Node, Args) ->
 %% -------------------------------------------------------------------
 %% Other helpers.
 %% -------------------------------------------------------------------
+
+get_node_index(Config, Node) when is_atom(Node) andalso Node =/= undefined ->
+    NodeConfigs = get_node_configs(Config),
+    get_node_index1(NodeConfigs, Node, 0);
+get_node_index(_Config, I) when is_integer(I) andalso I >= 0 ->
+    I.
+
+get_node_index1([NodeConfig | Rest], Node, I) ->
+    case ?config(nodename, NodeConfig) of
+        Node ->
+            I;
+        _ ->
+            case ?config(initial_nodename, NodeConfig) of
+                Node -> I;
+                _    -> get_node_index1(Rest, Node, I + 1)
+            end
+    end.
 
 get_node_configs(Config) ->
     ?config(rmq_nodes, Config).
@@ -1268,6 +1505,8 @@ delete_vhost(Config, Node, VHost) ->
 delete_vhost(Config, Node, VHost, Username) ->
     catch rpc(Config, Node, rabbit_vhost, delete, [VHost, Username]).
 
+-define(FORCE_VHOST_FAILURE_REASON, force_vhost_failure).
+
 force_vhost_failure(Config, VHost) -> force_vhost_failure(Config, 0, VHost).
 
 force_vhost_failure(Config, Node, VHost) ->
@@ -1281,7 +1520,8 @@ force_vhost_failure(Config, Node, VHost, Attempts) ->
             try
                 MessageStorePid = get_message_store_pid(Config, Node, VHost),
                 rpc(Config, Node,
-                    erlang, exit, [MessageStorePid, force_vhost_failure]),
+                    erlang, exit,
+                    [MessageStorePid, ?FORCE_VHOST_FAILURE_REASON]),
                 %% Give it a time to fail
                 timer:sleep(300),
                 force_vhost_failure(Config, Node, VHost, Attempts - 1)
@@ -1441,12 +1681,12 @@ clear_permissions(Config, Node, Username, VHost) ->
     clear_permissions(Config, Node, Username, VHost, <<"acting-user">>).
 
 clear_permissions(Config, Node, Username, VHost, ActingUser) ->
-    catch rpc(Config, Node,
-              rabbit_auth_backend_internal,
-              clear_permissions,
-              [rabbit_data_coercion:to_binary(Username),
-               rabbit_data_coercion:to_binary(VHost),
-               ActingUser]).
+    rpc(Config, Node,
+        rabbit_auth_backend_internal,
+        clear_permissions,
+        [rabbit_data_coercion:to_binary(Username),
+         rabbit_data_coercion:to_binary(VHost),
+         ActingUser]).
 
 set_vhost_limit(Config, Node, VHost, Limit0, Value) ->
     Limit = case Limit0 of
@@ -1454,11 +1694,10 @@ set_vhost_limit(Config, Node, VHost, Limit0, Value) ->
       max_queues      -> <<"max-queues">>;
       Other -> rabbit_data_coercion:to_binary(Other)
     end,
-    Definition = rabbit_json:encode(#{Limit => Value}),
+    Limits = [{Limit, Value}],
     rpc(Config, Node,
-        rabbit_vhost_limit,
-        set,
-        [VHost, Definition, <<"ct-tests">>]).
+        rabbit_vhost_limit, set,
+        [VHost, Limits, <<"ct-tests">>]).
 
 set_user_limits(Config, Username, Limits) ->
     set_user_limits(Config, 0, Username, Limits).
@@ -1552,6 +1791,9 @@ add_code_path_to_all_nodes(Config, Module) ->
       || Nodename <- Nodenames],
     ok.
 
+rpc(Config, Module, Function, Args) ->
+    rpc(Config, 0, Module, Function, Args).
+
 rpc(Config, Node, Module, Function, Args)
 when is_atom(Node) andalso Node =/= undefined ->
     rpc(Config, Node, Module, Function, Args, infinity);
@@ -1596,6 +1838,22 @@ start_node(Config, Node) ->
     case do_start_rabbitmq_node(Config, NodeConfig, I) of
         {skip, _} = Error -> {error, Error};
         _                 -> ok
+    end.
+
+async_start_node(Config, Node) ->
+    Self = self(),
+    spawn(fun() ->
+                  Reply = (catch start_node(Config, Node)),
+                  Self ! {async_start_node, Node, Reply}
+          end),
+    ok.
+
+wait_for_async_start_node(Node) ->
+    receive
+        {async_start_node, N, Reply} when N == Node ->
+            Reply
+    after 600000 ->
+            timeout
     end.
 
 start_broker(Config, Node) ->
@@ -1651,7 +1909,13 @@ kill_node_after(Config, Node, Sleep) ->
     kill_node(Config, Node).
 
 cluster_members_online(Config, Node) ->
-    rpc(Config, Node, rabbit_nodes, all_running, []).
+    try
+        rpc(Config, Node, rabbit_nodes, list_running, [])
+    catch
+        error:{exception, undef, [{rabbit_nodes, list_running, [], _} | _]} ->
+            Nodes = rpc(Config, Node, rabbit_nodes, all_running, []),
+            lists:filter(fun rabbit:is_running/1, Nodes)
+    end.
 
 await_os_pid_death(Pid) ->
     case rabbit_misc:is_os_process_alive(Pid) of
@@ -1676,25 +1940,45 @@ forget_cluster_node(Config, Node, NodeToForget, Opts) ->
         rabbit_ct_broker_helpers:get_node_config(Config, NodeToForget, nodename),
     rabbit_control_helper:command(forget_cluster_node, Name, [NameToForget], Opts).
 
+is_feature_flag_enabled(Config, FeatureName) ->
+    Node = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    rabbit_ct_broker_helpers:rpc(
+      Config, Node, rabbit_feature_flags, is_enabled, [FeatureName]).
+
 is_feature_flag_supported(Config, FeatureName) ->
     Nodes = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
     is_feature_flag_supported(Config, Nodes, FeatureName).
 
-is_feature_flag_supported(Config, [Node1 | _] = Nodes, FeatureName) ->
+is_feature_flag_supported(Config, [Node1 | _] = _Nodes, FeatureName) ->
     rabbit_ct_broker_helpers:rpc(
       Config, Node1,
-      rabbit_feature_flags, is_supported_remotely,
-      [Nodes, [FeatureName], 60000]).
+      rabbit_feature_flags, is_supported,
+      [[FeatureName], 60000]).
 
 enable_feature_flag(Config, FeatureName) ->
     Nodes = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
     enable_feature_flag(Config, Nodes, FeatureName).
 
-enable_feature_flag(Config, [Node1 | _] = Nodes, FeatureName) ->
+enable_feature_flag(Config, Nodes, FeatureName) ->
     case is_feature_flag_supported(Config, Nodes, FeatureName) of
         true ->
-            rabbit_ct_broker_helpers:rpc(
-              Config, Node1, rabbit_feature_flags, enable, [FeatureName]);
+            %% Nodes might not be clustered for some test suites, so enabling
+            %% feature flags on the first one of the list is not enough
+            lists:foldl(
+              fun(N, ok) ->
+                      case rabbit_ct_broker_helpers:rpc(
+                             Config, N, rabbit_feature_flags, enable, [FeatureName]) of
+                          {error, unsupported} ->
+                              {skip,
+                               lists:flatten(
+                                 io_lib:format("'~ts' feature flag is unsupported",
+                                               [FeatureName]))};
+                          Any ->
+                              Any
+                      end;
+                 (_, Other) ->
+                      Other
+              end, ok, Nodes);
         false ->
             {skip,
              lists:flatten(
@@ -1924,6 +2208,11 @@ cover_add_node(Node)
   when is_atom(Node) andalso Node =/= undefined ->
     if_cover(
       fun() ->
+              %% Dependency horus starts registered process cover_server on the RabbitMQ
+              %% node. If we weren't to stop that process first, ct_cover:add_nodes/1 would
+              %% print `{error, {already_started, _CoverServerPid}}` and return
+              %% `{ok, []}` resulting in no test coverage.
+              ok = erpc:call(Node, cover, stop, []),
               {ok, [Node]} = ct_cover:add_nodes([Node])
       end).
 
@@ -1940,9 +2229,18 @@ cover_remove_node(Config, Node) ->
     cover_remove_node(Nodename).
 
 if_cover(F) ->
-    case os:getenv("COVER") of
-        false ->
-            ok;
-        _ ->
-            F()
+    case {
+      %% make ct COVER=1
+      os:getenv("COVER"),
+      %% bazel coverage
+      os:getenv("COVERAGE")
+     } of
+        {false, false} -> ok;
+        _ -> F()
     end.
+
+setup_meck(Config) ->
+    {Mod, Bin, File} = code:get_object_code(meck),
+    [true | _] = rpc_all(Config, code, add_path, [filename:dirname(File)]),
+    [{module, Mod} | _] = rpc_all(Config, code, load_binary, [Mod, File, Bin]),
+    ok.

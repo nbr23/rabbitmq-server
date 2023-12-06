@@ -2,12 +2,13 @@
 %% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at https://mozilla.org/MPL/2.0/.
 %%
-%% Copyright (c) 2007-2022 VMware, Inc. or its affiliates.  All rights reserved.
+%% Copyright (c) 2007-2023 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  All rights reserved.
 %%
 
 -module(dynamic_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
 
 -compile(export_all).
@@ -31,6 +32,7 @@ groups() ->
           set_empty_properties_using_map,
           headers,
           exchange,
+          missing_dest_exchange,
           restart,
           change_definition,
           autodelete,
@@ -188,8 +190,9 @@ headers(Config) ->
                 <<"test">>,
                 [{<<"src-queue">>,            <<"src">>},
                  {<<"dest-queue">>,           <<"dest">>}]),
-            #amqp_msg{props = #'P_basic'{headers = undefined}} =
-                  publish_expect(Ch, <<>>, <<"src">>, <<"dest">>, <<"hi1">>),
+            ?assertMatch(#amqp_msg{props = #'P_basic'{headers = H0}}
+                           when H0 == undefined orelse H0 == [],
+                                publish_expect(Ch, <<>>, <<"src">>, <<"dest">>, <<"hi1">>)),
 
             shovel_test_utils:set_param(Config,
                 <<"test">>,
@@ -261,6 +264,36 @@ exchange(Config) ->
               publish_expect(Ch, <<"amq.direct">>, <<"test-key">>,
                              <<"queue">>, <<"hello">>)
       end).
+
+
+missing_dest_exchange(Config) ->
+    with_ch(Config,
+        fun (Ch) ->
+            amqp_channel:call(
+            Ch, #'queue.declare'{queue = <<"src">>,
+                                 durable = true}),
+            amqp_channel:call(
+              Ch, #'queue.declare'{queue = <<"dest">>,
+                                   durable = true}),
+            amqp_channel:call(
+              Ch, #'queue.bind'{queue = <<"src">>,
+                                exchange = <<"amq.direct">>,
+                                routing_key = <<"src-key">>}),
+            shovel_test_utils:set_param(Config,
+                        <<"test">>, [{<<"src-queue">>, <<"src">>},
+                                        {<<"dest-exchange">>, <<"dest-ex">>},
+                                        {<<"dest-exchange-key">>, <<"dest-key">>},
+                                        {<<"src-prefetch-count">>, 1}]),
+            publish(Ch, <<"amq.direct">>, <<"src-key">>, <<"hello">>),
+            expect_empty(Ch, <<"src">>),
+            amqp_channel:call(
+              Ch, #'exchange.declare'{exchange = <<"dest-ex">>}),
+            amqp_channel:call(
+              Ch, #'queue.bind'{queue = <<"dest">>,
+                                exchange = <<"dest-ex">>,
+                                routing_key = <<"dest-key">>}),
+            publish_expect(Ch, <<"amq.direct">>, <<"src-key">>, <<"dest">>, <<"hello!">>)
+end).
 
 restart(Config) ->
     with_ch(Config,

@@ -2,7 +2,7 @@
 ## License, v. 2.0. If a copy of the MPL was not distributed with this
 ## file, You can obtain one at https://mozilla.org/MPL/2.0/.
 ##
-## Copyright (c) 2016-2022 VMware, Inc. or its affiliates.  All rights reserved.
+## Copyright (c) 2016-2023 VMware, Inc. or its affiliates.  All rights reserved.
 
 defmodule RabbitMQ.CLI.Ctl.Commands.UpdateClusterNodesCommand do
   alias RabbitMQ.CLI.Core.{Config, DocGuide, Helpers}
@@ -17,12 +17,17 @@ defmodule RabbitMQ.CLI.Ctl.Commands.UpdateClusterNodesCommand do
     long_or_short_names = Config.get_option(:longnames, options)
     seed_node_normalised = Helpers.normalise_node(seed_node, long_or_short_names)
 
-    :rabbit_misc.rpc_call(
-      node_name,
-      :rabbit_mnesia,
-      :update_cluster_nodes,
-      [seed_node_normalised]
-    )
+    case :rabbit_misc.rpc_call(node_name, :rabbit_db_cluster, :update_cluster_nodes, [
+           seed_node_normalised
+         ]) do
+      {:badrpc, {:EXIT, {:undef, _}}} ->
+        :rabbit_misc.rpc_call(node_name, :rabbit_mnesia, :update_cluster_nodes, [
+          seed_node_normalised
+        ])
+
+      ret0 ->
+        ret0
+    end
   end
 
   def usage() do

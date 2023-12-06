@@ -51,10 +51,14 @@ log(LogEvent, Config) ->
 
 do_log(LogEvent, #{config := #{exchange := Exchange}} = Config) ->
     RoutingKey = make_routing_key(LogEvent, Config),
-    AmqpMsg = log_event_to_amqp_msg(LogEvent, Config),
+    PBasic = log_event_to_amqp_msg(LogEvent, Config),
     Body = try_format_body(LogEvent, Config),
-    case rabbit_basic:publish(Exchange, RoutingKey, AmqpMsg, Body) of
-        ok                 -> ok;
+    Content = rabbit_basic:build_content(PBasic, Body),
+    Anns = #{exchange => Exchange#resource.name,
+             routing_keys => [RoutingKey]},
+    Msg = mc:init(mc_amqpl, Content, Anns),
+    case rabbit_queue_type:publish_at_most_once(Exchange, Msg) of
+        ok -> ok;
         {error, not_found} -> ok
     end.
 
@@ -120,10 +124,26 @@ start_setup_proc(#{config := InternalConfig} = Config) ->
     {ok, DefaultVHost} = application:get_env(rabbit, default_vhost),
     Exchange = rabbit_misc:r(DefaultVHost, exchange, ?LOG_EXCH_NAME),
     InternalConfig1 = InternalConfig#{exchange => Exchange},
-
-    Pid = spawn(fun() -> setup_proc(Config#{config => InternalConfig1}) end),
+    Pid = spawn(fun() ->
+                        wait_for_initial_pass(60),
+                        setup_proc(Config#{config => InternalConfig1})
+                end),
     InternalConfig2 = InternalConfig1#{setup_proc => Pid},
     Config#{config => InternalConfig2}.
+
+%% Declaring an exchange requires the metadata store to be ready
+%% which happens on a boot step after the second phase of the prelaunch.
+%% This function waits for the store initialisation.
+wait_for_initial_pass(0) ->
+    ok;
+wait_for_initial_pass(N) ->
+    case rabbit_db:is_init_finished() of
+        false ->
+            timer:sleep(1000),
+            wait_for_initial_pass(N - 1);
+        true ->
+            ok
+    end.
 
 setup_proc(
   #{config := #{exchange := #resource{name = Name,
@@ -174,7 +194,7 @@ unconfigure_exchange(
                                       virtual_host = VHost} = Exchange,
                 setup_proc := Pid}}) ->
     Pid ! stop,
-    rabbit_exchange:delete(Exchange, false, ?INTERNAL_USER),
+    _ = rabbit_exchange:delete(Exchange, false, ?INTERNAL_USER),
     ?LOG_INFO(
        "Logging to exchange '~ts' in vhost '~ts' disabled",
        [Name, VHost],

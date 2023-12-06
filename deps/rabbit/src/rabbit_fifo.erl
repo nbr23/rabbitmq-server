@@ -2,7 +2,7 @@
 %% License, v. 2.0. If a copy of the MPL was not distributed with this
 %% file, You can obtain one at https://mozilla.org/MPL/2.0/.
 %%
-%% Copyright (c) 2007-2022 VMware, Inc. or its affiliates.  All rights reserved.
+%% Copyright (c) 2007-2023 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries.  All rights reserved.
 
 %% before post gc 1M msg: 203MB, after recovery + gc: 203MB
 
@@ -72,7 +72,8 @@
         ]).
 
 -ifdef(TEST).
--export([update_header/4]).
+-export([update_header/4,
+         chunk_disk_msgs/3]).
 -endif.
 
 %% command records representing all the protocol actions that are supported
@@ -407,6 +408,7 @@ apply(Meta, #checkout{spec = Spec, meta = ConsumerMeta,
               credit = Credit,
               delivery_count = DeliveryCount,
               next_msg_id = NextMsgId} = Consumer,
+
     %% reply with a consumer summary
     Reply = {ok, #{next_msg_id => NextMsgId,
                    credit => Credit,
@@ -860,8 +862,10 @@ state_enter0(leader, #?MODULE{consumers = Cons,
     Mons = [{monitor, process, P} || P <- Pids],
     Nots = [{send_msg, P, leader_change, ra_event} || P <- Pids],
     NodeMons = lists:usort([{monitor, node, node(P)} || P <- Pids]),
-    FHReservation = [{mod_call, rabbit_quorum_queue, file_handle_leader_reservation, [Resource]}],
-    Effects = TimerEffs ++ Mons ++ Nots ++ NodeMons ++ FHReservation,
+    FHReservation = [{mod_call, rabbit_quorum_queue,
+                      file_handle_leader_reservation, [Resource]}],
+    NotifyDecs = notify_decorators_startup(Resource),
+    Effects = TimerEffs ++ Mons ++ Nots ++ NodeMons ++ FHReservation ++ [NotifyDecs],
     case BLH of
         undefined ->
             Effects;
@@ -895,8 +899,7 @@ tick(Ts, #?MODULE{cfg = #cfg{name = _Name,
         true ->
             [{mod_call, rabbit_quorum_queue, spawn_deleter, [QName]}];
         false ->
-            [{mod_call, rabbit_quorum_queue,
-              handle_tick, [QName, overview(State), all_nodes(State)]}]
+            [{aux, {handle_tick, [QName, overview(State), all_nodes(State)]}}]
     end.
 
 -spec overview(state()) -> map().
@@ -979,7 +982,7 @@ which_module(3) -> ?MODULE.
                last_decorators_state :: term(),
                capacity :: term(),
                gc = #aux_gc{} :: #aux_gc{},
-               unused,
+               tick_pid,
                unused2}).
 
 init_aux(Name) when is_atom(Name) ->
@@ -1003,8 +1006,8 @@ handle_aux(leader, _, garbage_collection, Aux, Log, MacState) ->
     {no_reply, force_eval_gc(Log, MacState, Aux), Log};
 handle_aux(follower, _, garbage_collection, Aux, Log, MacState) ->
     {no_reply, force_eval_gc(Log, MacState, Aux), Log};
-handle_aux(leader, cast, {#return{msg_ids = MsgIds,
-                                  consumer_id = ConsumerId}, Corr, Pid},
+handle_aux(_RaftState, cast, {#return{msg_ids = MsgIds,
+                                      consumer_id = ConsumerId}, Corr, Pid},
            Aux0, Log0, #?MODULE{cfg = #cfg{delivery_limit = undefined},
                                 consumers = Consumers}) ->
     case Consumers of
@@ -1029,6 +1032,19 @@ handle_aux(leader, cast, {#return{msg_ids = MsgIds,
         _ ->
             {no_reply, Aux0, Log0}
     end;
+handle_aux(leader, _, {handle_tick, [QName, Overview, Nodes]},
+           #?AUX{tick_pid = Pid} = Aux, Log, _) ->
+    NewPid =
+        case process_is_alive(Pid) of
+            false ->
+                %% No active TICK pid
+                %% this function spawns and returns the tick process pid
+                rabbit_quorum_queue:handle_tick(QName, Overview, Nodes);
+            true ->
+                %% Active TICK pid, do nothing
+                Pid
+        end,
+    {no_reply, Aux#?AUX{tick_pid = NewPid}, Log};
 handle_aux(_, _, {get_checked_out, ConsumerId, MsgIds},
            Aux0, Log0, #?MODULE{cfg = #cfg{},
                                 consumers = Consumers}) ->
@@ -1087,18 +1103,19 @@ handle_aux(_RaState, cast, eol, #?AUX{name = Name} = Aux, Log, _) ->
     ets:delete(rabbit_fifo_usage, Name),
     {no_reply, Aux, Log};
 handle_aux(_RaState, {call, _From}, oldest_entry_timestamp, Aux,
-           Log, #?MODULE{} = State) ->
-    Ts = case smallest_raft_index(State) of
-             %% if there are no entries, we return current timestamp
-             %% so that any previously obtained entries are considered older than this
-             undefined ->
-                 erlang:system_time(millisecond);
-             Idx when is_integer(Idx) ->
-                 %% TODO: make more defensive to avoid potential crash
-                 {{_, _, {_, Meta, _, _}}, _Log1} = ra_log:fetch(Idx, Log),
-                 #{ts := Timestamp} = Meta,
-                 Timestamp
-         end,
+           Log0, #?MODULE{} = State) ->
+    {Ts, Log} = case smallest_raft_index(State) of
+                    %% if there are no entries, we return current timestamp
+                    %% so that any previously obtained entries are considered
+                    %% older than this
+                    undefined ->
+                        {erlang:system_time(millisecond), Log0};
+                    Idx when is_integer(Idx) ->
+                        %% TODO: make more defensive to avoid potential crash
+                        {{_, _, {_, Meta, _, _}}, Log1} = ra_log:fetch(Idx, Log0),
+                        #{ts := Timestamp} = Meta,
+                        {Timestamp, Log1}
+                end,
     {reply, {ok, Ts}, Aux, Log};
 handle_aux(_RaState, {call, _From}, {peek, Pos}, Aux0,
            Log0, MacState) ->
@@ -1151,6 +1168,10 @@ force_eval_gc(Log, #?MODULE{cfg = #cfg{resource = QR}},
             AuxState
     end.
 
+process_is_alive(Pid) when is_pid(Pid) ->
+    is_process_alive(Pid);
+process_is_alive(_) ->
+    false.
 %%% Queries
 
 query_messages_ready(State) ->
@@ -1283,9 +1304,8 @@ query_notify_decorators_info(#?MODULE{consumers = Consumers} = State) ->
     MaxActivePriority = maps:fold(
                           fun(_, #consumer{credit = C,
                                            status = up,
-                                           cfg = #consumer_cfg{priority = P0}},
+                                           cfg = #consumer_cfg{priority = P}},
                               MaxP) when C > 0 ->
-                                  P = -P0,
                                   case MaxP of
                                       empty -> P;
                                       MaxP when MaxP > P -> MaxP;
@@ -1513,10 +1533,6 @@ drop_head(#?MODULE{ra_indexes = Indexes0} = State0, Effects) ->
     end.
 
 maybe_set_msg_ttl(#basic_message{content = #content{properties = none}},
-                  _, Header,
-                  #?MODULE{cfg = #cfg{msg_ttl = undefined}}) ->
-    Header;
-maybe_set_msg_ttl(#basic_message{content = #content{properties = none}},
                   RaCmdTs, Header,
                   #?MODULE{cfg = #cfg{msg_ttl = PerQueueMsgTTL}}) ->
     update_expiry_header(RaCmdTs, PerQueueMsgTTL, Header);
@@ -1529,9 +1545,15 @@ maybe_set_msg_ttl(#basic_message{content = #content{properties = Props}},
     {ok, PerMsgMsgTTL} = rabbit_basic:parse_expiration(Props),
     TTL = min(PerMsgMsgTTL, PerQueueMsgTTL),
     update_expiry_header(RaCmdTs, TTL, Header);
-maybe_set_msg_ttl(_, _, Header,
-                  #?MODULE{cfg = #cfg{}}) ->
-    Header.
+maybe_set_msg_ttl(Msg, RaCmdTs, Header,
+                  #?MODULE{cfg = #cfg{msg_ttl = MsgTTL}}) ->
+    case mc:is(Msg) of
+        true ->
+            TTL = min(MsgTTL, mc:ttl(Msg)),
+            update_expiry_header(RaCmdTs, TTL, Header);
+        false ->
+            Header
+    end.
 
 update_expiry_header(_, undefined, Header) ->
     Header;
@@ -1876,9 +1898,9 @@ checkout(#{index := Index} = Meta,
     end.
 
 checkout0(Meta, {success, ConsumerId, MsgId,
-                 ?MSG(RaftIdx, Header), ExpiredMsg, State, Effects},
+                 ?MSG(_RaftIdx, _Header) = Msg, ExpiredMsg, State, Effects},
           SendAcc0) ->
-    DelMsg = {RaftIdx, {MsgId, Header}},
+    DelMsg = {MsgId, Msg},
     SendAcc = case maps:get(ConsumerId, SendAcc0, undefined) of
                   undefined ->
                       SendAcc0#{ConsumerId => [DelMsg]};
@@ -1887,7 +1909,7 @@ checkout0(Meta, {success, ConsumerId, MsgId,
               end,
     checkout0(Meta, checkout_one(Meta, ExpiredMsg, State, Effects), SendAcc);
 checkout0(_Meta, {_Activity, ExpiredMsg, State0, Effects0}, SendAcc) ->
-    Effects = append_delivery_effects(Effects0, SendAcc, State0),
+    Effects = add_delivery_effects(Effects0, SendAcc, State0),
     {State0, ExpiredMsg, lists:reverse(Effects)}.
 
 evaluate_limit(_Index, Result, _BeforeState,
@@ -1942,12 +1964,33 @@ evaluate_limit(Index, Result, BeforeState,
             {State0, Result, Effects0}
     end.
 
-append_delivery_effects(Effects0, AccMap, _State) when map_size(AccMap) == 0 ->
+
+%% [6,5,4,3,2,1] -> [[1,2],[3,4],[5,6]]
+chunk_disk_msgs([], _Bytes, [[] | Chunks]) ->
+    Chunks;
+chunk_disk_msgs([], _Bytes, Chunks) ->
+    Chunks;
+chunk_disk_msgs([{_MsgId, ?MSG(_RaftIdx, Header)} = Msg | Rem],
+                Bytes, Chunks)
+  when Bytes >= ?DELIVERY_CHUNK_LIMIT_B ->
+    Size = get_header(size, Header),
+    chunk_disk_msgs(Rem, Size, [[Msg] | Chunks]);
+chunk_disk_msgs([{_MsgId, ?MSG(_RaftIdx, Header)} = Msg | Rem], Bytes,
+                [CurChunk | Chunks]) ->
+    Size = get_header(size, Header),
+    chunk_disk_msgs(Rem, Bytes + Size, [[Msg | CurChunk] | Chunks]).
+
+add_delivery_effects(Effects0, AccMap, _State)
+  when map_size(AccMap) == 0 ->
     %% does this ever happen?
     Effects0;
-append_delivery_effects(Effects0, AccMap, State) ->
-     maps:fold(fun (C, DiskMsgs, Ef) when is_list(DiskMsgs) ->
-                       [delivery_effect(C, lists:reverse(DiskMsgs), State) | Ef]
+add_delivery_effects(Effects0, AccMap, State) ->
+     maps:fold(fun (C, DiskMsgs, Efs)
+                     when is_list(DiskMsgs) ->
+                       lists:foldl(
+                         fun (Msgs, E) ->
+                                 [delivery_effect(C, Msgs, State) | E]
+                         end, Efs, chunk_disk_msgs(DiskMsgs, 0, [[]]))
                end, Effects0, AccMap).
 
 take_next_msg(#?MODULE{returns = Returns0,
@@ -1978,18 +2021,20 @@ get_next_msg(#?MODULE{returns = Returns0,
             Msg
     end.
 
-delivery_effect({CTag, CPid}, [{Idx, {MsgId, Header}}],
+delivery_effect({CTag, CPid}, [{MsgId, ?MSG(Idx,  Header)}],
                 #?MODULE{msg_cache = {Idx, RawMsg}}) ->
     {send_msg, CPid, {delivery, CTag, [{MsgId, {Header, RawMsg}}]},
      [local, ra_event]};
 delivery_effect({CTag, CPid}, Msgs, _State) ->
-    {RaftIdxs, Data} = lists:unzip(Msgs),
+    RaftIdxs = lists:foldr(fun ({_, ?MSG(I, _)}, Acc) ->
+                                   [I | Acc]
+                           end, [], Msgs),
     {log, RaftIdxs,
      fun(Log) ->
              DelMsgs = lists:zipwith(
-                         fun (Cmd, {MsgId, Header}) ->
+                         fun (Cmd, {MsgId, ?MSG(_Idx,  Header)}) ->
                                  {MsgId, {Header, get_msg(Cmd)}}
-                         end, Log, Data),
+                         end, Log, Msgs),
              [{send_msg, CPid, {delivery, CTag, DelMsgs}, [local, ra_event]}]
      end,
      {local, node(CPid)}}.
@@ -2351,8 +2396,14 @@ message_size(#basic_message{content = Content}) ->
 message_size(B) when is_binary(B) ->
     byte_size(B);
 message_size(Msg) ->
-    %% probably only hit this for testing so ok to use erts_debug
-    erts_debug:size(Msg).
+    case mc:is(Msg) of
+        true ->
+            {_, PayloadSize} = mc:size(Msg),
+            PayloadSize;
+        false ->
+            %% probably only hit this for testing so ok to use erts_debug
+            erts_debug:size(Msg)
+    end.
 
 
 all_nodes(#?MODULE{consumers = Cons0,
@@ -2437,6 +2488,10 @@ get_priority_from_args(_) ->
 notify_decorators_effect(QName, MaxActivePriority, IsEmpty) ->
     {mod_call, rabbit_quorum_queue, spawn_notify_decorators,
      [QName, consumer_state_changed, [MaxActivePriority, IsEmpty]]}.
+
+notify_decorators_startup(QName) ->
+    {mod_call, rabbit_quorum_queue, spawn_notify_decorators,
+     [QName, startup, []]}.
 
 convert(To, To, State) ->
     State;
